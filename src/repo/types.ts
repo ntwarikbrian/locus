@@ -153,6 +153,7 @@ export type ThinkingStage =
   | 'Generating response'
   | 'Thinking'
   | 'Reading file'
+  | 'Running tool'
 
 export interface ThinkingProgressEvent {
   stage: ThinkingStage

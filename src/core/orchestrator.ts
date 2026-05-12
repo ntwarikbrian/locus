@@ -11,9 +11,12 @@ import { isFastPathCandidate, resolveFastPath } from './fast-path.js'
 import pc from 'picocolors'
 import { ThinkingStatus } from '../ui/thinking-status.js'
 import { readFileSync, statSync } from 'fs'
+import { estimateTokens } from '../ai/tokenizer.js'
 import { resolve } from 'path'
+import { getToolDefinitions, getTool } from '../tools/registry.js'
 
-const MAX_AGENTIC_READS = 3
+const MAX_AGENTIC_READS = 8
+const MAX_TOOL_CALLS = 10
 const MAX_READ_SIZE = 200_000
 const READ_PATTERN = /@read\(([^)]+)\)/g
 
@@ -25,6 +28,7 @@ export class Orchestrator {
   private store: SessionStore
   private cache: ResponseCache
   private maxIterations = 25
+  private lastContextTokens = 0
 
   constructor(provider: LLMProvider, resumeSessionId?: string) {
     this.store = new SessionStore(getConfig().storageDir)
@@ -47,6 +51,11 @@ export class Orchestrator {
     }
 
     this.initSystemMessage()
+  }
+
+  getContextUsage(): { used: number; max: number } {
+    const max = getConfig().nCtx ?? 8192
+    return { used: this.lastContextTokens, max }
   }
 
   private initSystemMessage(): void {
@@ -176,23 +185,53 @@ export class Orchestrator {
     this.session.messages.push(this.promptBuilder.buildUser(input))
 
     let readsPerformed = 0
+    let toolCallsUsed = 0
+    const readFilesSet = new Set<string>()
     for (let i = 0; i < this.maxIterations; i++) {
       const pruned = this.contextEngine.prune(this.session.messages)
-      const response = await this.inference.chat(pruned)
+      this.lastContextTokens = pruned.reduce((sum, m) => sum + estimateTokens(m.content ?? ''), 0)
+      const toolDefs = useAgentic ? getToolDefinitions() : undefined
+      const response = await this.inference.chat(pruned, toolDefs)
 
       const content = response.content ?? ''
 
+      // Handle tool calls from function-calling protocol
+      if (response.tool_calls && response.tool_calls.length > 0 && toolCallsUsed < MAX_TOOL_CALLS) {
+        this.session.messages.push({ role: 'assistant', content: content || null, tool_calls: response.tool_calls })
+        for (const tc of response.tool_calls) {
+          const tool = getTool(tc.function.name)
+          if (tool) {
+            try {
+              const args = JSON.parse(tc.function.arguments || '{}')
+              const result = await tool.handler(args)
+              const truncated = result.length > 4000 ? result.slice(0, 4000) + '\n...(truncated)' : result
+              this.session.messages.push({ role: 'tool', content: truncated, tool_call_id: tc.id })
+            } catch (err: any) {
+              this.session.messages.push({ role: 'tool', content: `Error: ${err.message}`, tool_call_id: tc.id })
+            }
+            toolCallsUsed++
+          }
+        }
+        continue
+      }
+
       if (useAgentic && readsPerformed < MAX_AGENTIC_READS) {
         const readRequests = this.extractReads(content)
-        if (readRequests.length > 0) {
+        const newReads = readRequests.filter(fp => !readFilesSet.has(fp))
+        if (newReads.length > 0) {
           this.session.messages.push({ role: 'assistant', content })
           const readResults: string[] = []
-          for (const fp of readRequests.slice(0, MAX_AGENTIC_READS - readsPerformed)) {
+          for (const fp of newReads.slice(0, MAX_AGENTIC_READS - readsPerformed)) {
+            readFilesSet.add(fp)
             const fileContent = this.executeRead(fp)
             readResults.push(`Contents of \`${fp}\`:\n\`\`\`\n${fileContent}\n\`\`\``)
             readsPerformed++
           }
           this.session.messages.push({ role: 'user', content: readResults.join('\n\n') })
+          continue
+        } else if (readRequests.length > 0) {
+          this.session.messages.push({ role: 'assistant', content })
+          this.session.messages.push({ role: 'user', content: `All requested files have already been read: ${readRequests.join(', ')}. Answer using the file contents provided above.` })
           continue
         }
       }
@@ -278,9 +317,12 @@ export class Orchestrator {
     this.session.messages.push(this.promptBuilder.buildUser(input))
 
     let readsPerformed = 0
+    let toolCallsUsed = 0
+    const readFilesSet = new Set<string>()
 
     for (let i = 0; i < this.maxIterations; i++) {
       const pruned = this.contextEngine.prune(this.session.messages)
+      this.lastContextTokens = pruned.reduce((sum, m) => sum + estimateTokens(m.content ?? ''), 0)
       status.update('Generating response')
       let firstToken = true
       let accumulated = ''
@@ -301,8 +343,10 @@ export class Orchestrator {
         onToken?.(token)
       }
 
+      const toolDefs = useAgenticContext ? getToolDefinitions() : undefined
+      let streamResult: import('../providers/types.js').LLMResponse | null = null
       try {
-        await this.inference.chatStream(pruned, undefined, wrappedOnToken, { signal: repAbort.signal })
+        streamResult = await this.inference.chatStream(pruned, toolDefs, wrappedOnToken, { signal: repAbort.signal })
       } catch (err: any) {
         if (err.name === 'AbortError' && signal?.aborted) throw err
         if (err.name === 'AbortError' && repAbort.signal.aborted && !signal?.aborted) { /* repetition abort */ }
@@ -315,24 +359,59 @@ export class Orchestrator {
 
       const content = trimRepeatedTail(accumulated)
 
+      // Handle tool calls from function-calling protocol
+      if (streamResult?.tool_calls && streamResult.tool_calls.length > 0 && toolCallsUsed < MAX_TOOL_CALLS) {
+        this.session.messages.push({ role: 'assistant', content: content || null, tool_calls: streamResult.tool_calls })
+        for (const tc of streamResult.tool_calls) {
+          const tool = getTool(tc.function.name)
+          if (tool) {
+            status.start('Running tool')
+            try {
+              const args = JSON.parse(tc.function.arguments || '{}')
+              const result = await tool.handler(args)
+              const truncated = result.length > 4000 ? result.slice(0, 4000) + '\n...(truncated)' : result
+              this.session.messages.push({ role: 'tool', content: truncated, tool_call_id: tc.id })
+              onToken?.(`\n[${tc.function.name}] ${truncated.slice(0, 100)}${truncated.length > 100 ? '...' : ''}\n`)
+            } catch (err: any) {
+              this.session.messages.push({ role: 'tool', content: `Error: ${err.message}`, tool_call_id: tc.id })
+              onToken?.(`\n[${tc.function.name}] Error: ${err.message}\n`)
+            }
+            status.stop()
+            toolCallsUsed++
+          }
+        }
+        continue
+      }
+
       // Agentic read loop: detect @read(path) patterns
       if (useAgenticContext && readsPerformed < MAX_AGENTIC_READS) {
         const readRequests = this.extractReads(content)
-        if (readRequests.length > 0) {
+        const newReads = readRequests.filter(fp => !readFilesSet.has(fp))
+        if (newReads.length > 0) {
           this.session.messages.push({ role: 'assistant', content })
 
           const readResults: string[] = []
-          for (const fp of readRequests.slice(0, MAX_AGENTIC_READS - readsPerformed)) {
+          for (const fp of newReads.slice(0, MAX_AGENTIC_READS - readsPerformed)) {
             status.start('Reading file')
+            readFilesSet.add(fp)
             const fileContent = this.executeRead(fp)
             readResults.push(`Contents of \`${fp}\`:\n\`\`\`\n${fileContent}\n\`\`\``)
             readsPerformed++
           }
           status.stop()
 
-          // Inject file contents and continue the loop
-          const readMsg = readResults.join('\n\n')
+          const skippedDupes = readRequests.filter(fp => readFilesSet.has(fp) && !newReads.includes(fp))
+          let readMsg = readResults.join('\n\n')
+          if (skippedDupes.length > 0) {
+            readMsg += `\n\n(Skipped already-read files: ${skippedDupes.join(', ')})`
+          }
           this.session.messages.push({ role: 'user', content: readMsg })
+          onToken?.('\n')
+          continue
+        } else if (readRequests.length > 0) {
+          // All requested files were already read — tell the model
+          this.session.messages.push({ role: 'assistant', content })
+          this.session.messages.push({ role: 'user', content: `All requested files have already been read: ${readRequests.join(', ')}. Answer using the file contents provided above.` })
           onToken?.('\n')
           continue
         }

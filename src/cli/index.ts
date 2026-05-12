@@ -104,6 +104,15 @@ const HELP_UNCONFIGURED = buildHelpUnconfigured()
 
 const ESC_BYTE = 27
 
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${(ms / 1000).toFixed(1)}s`
+  const totalSec = Math.floor(ms / 1000)
+  if (totalSec < 60) return `${totalSec}s`
+  const min = Math.floor(totalSec / 60)
+  const sec = totalSec % 60
+  return sec > 0 ? `${min}min ${sec}s` : `${min}min`
+}
+
 function prompt(licensed: boolean, ready: boolean): string {
   if (!licensed) return `${pc.dim('[')}${pc.yellow('unlicensed')}${pc.dim(']')} ${pc.yellow('❯')} `
   if (!ready) return `${pc.dim('[')}${pc.yellow('no runtime')}${pc.dim(']')} ${pc.yellow('❯')} `
@@ -234,12 +243,22 @@ export class CLI {
         const formatter = new ResponseFormatter((text) => {
           process.stdout.write(text)
         })
+        const startTime = Date.now()
         await this.orchestrator.runStream(t, (token) => {
           formatter.write(token)
         }, ac.signal)
         formatter.flush()
+        const elapsed = Date.now() - startTime
         clearEscHint()
-        process.stdout.write('\n')
+
+        process.stdout.write(`\n${pc.dim(formatDuration(elapsed))}\n`)
+
+        const { used, max } = this.orchestrator.getContextUsage()
+        const pct = max > 0 ? Math.round((used / max) * 100) : 0
+        const ctxLabel = `ctx: ${used}/${max} (${pct}%)`
+        const cols = process.stdout.columns || 80
+        const pad = Math.max(0, cols - ctxLabel.length)
+        process.stdout.write(' '.repeat(pad) + pc.dim(ctxLabel) + '\n')
       } catch (err: any) {
         clearEscHint()
         if (err.name === 'AbortError' || err.name === 'CanceledError') {
