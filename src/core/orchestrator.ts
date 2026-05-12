@@ -10,6 +10,12 @@ import { getConfig } from '../runtime/state.js'
 import { isFastPathCandidate, resolveFastPath } from './fast-path.js'
 import pc from 'picocolors'
 import { ThinkingStatus } from '../ui/thinking-status.js'
+import { readFileSync, statSync } from 'fs'
+import { resolve } from 'path'
+
+const MAX_AGENTIC_READS = 3
+const MAX_READ_SIZE = 200_000
+const READ_PATTERN = /@read\(([^)]+)\)/g
 
 export class Orchestrator {
   private session: Session
@@ -57,6 +63,43 @@ export class Orchestrator {
     this.promptBuilder.setFileContext(ctx)
     const systemMsg = this.promptBuilder.buildSystem()
     this.contextEngine.setSystemMessage(systemMsg)
+  }
+
+  private async suggestContext(input: string, onStage?: (stage: import('../repo/types.js').ThinkingStage) => void): Promise<void> {
+    const { suggestions, tree } = await this.contextEngine.suggestContext(input, undefined, (evt) => onStage?.(evt.stage))
+    this.promptBuilder.setFileContext('')
+    this.promptBuilder.setFileSuggestions(suggestions, tree)
+    const systemMsg = this.promptBuilder.buildSystem()
+    this.contextEngine.setSystemMessage(systemMsg)
+  }
+
+  private executeRead(filePath: string): string {
+    const root = process.cwd()
+    const resolved = resolve(root, filePath.trim())
+    if (!resolved.startsWith(root)) return `Error: Access denied — path outside project root`
+    try {
+      const stat = statSync(resolved)
+      if (!stat.isFile()) return `Error: '${filePath}' is not a file`
+      if (stat.size > MAX_READ_SIZE) return `Error: File too large (${(stat.size / 1024).toFixed(0)} KB)`
+      if (stat.size === 0) return '(empty file)'
+      const content = readFileSync(resolved, 'utf-8')
+      const lines = content.split('\n')
+      const limit = Math.min(lines.length, 200)
+      return lines.slice(0, limit).map((l, i) => `${i + 1}: ${l}`).join('\n')
+    } catch (err: any) {
+      if (err.code === 'ENOENT') return `Error: File not found: '${filePath}'`
+      return `Error: ${err.message}`
+    }
+  }
+
+  private extractReads(text: string): string[] {
+    const matches: string[] = []
+    let match
+    const re = new RegExp(READ_PATTERN.source, 'g')
+    while ((match = re.exec(text)) !== null) {
+      matches.push(match[1].trim())
+    }
+    return matches
   }
 
   private async tryCached(input: string, fingerprint: string, onToken?: (token: string) => void, signal?: AbortSignal): Promise<string | null> {
@@ -111,20 +154,39 @@ export class Orchestrator {
       return sharedCached
     }
 
-    if (needsCodeContext(input)) {
-      await this.buildContext(input)
+    const useAgentic = needsCodeContext(input)
+    if (useAgentic) {
+      await this.suggestContext(input)
     } else {
       this.promptBuilder.setFileContext('')
+      this.promptBuilder.clearSuggestions()
       const systemMsg = this.promptBuilder.buildSystem()
       this.contextEngine.setSystemMessage(systemMsg)
     }
     this.session.messages.push(this.promptBuilder.buildUser(input))
 
+    let readsPerformed = 0
     for (let i = 0; i < this.maxIterations; i++) {
       const pruned = this.contextEngine.prune(this.session.messages)
       const response = await this.inference.chat(pruned)
 
       const content = response.content ?? ''
+
+      if (useAgentic && readsPerformed < MAX_AGENTIC_READS) {
+        const readRequests = this.extractReads(content)
+        if (readRequests.length > 0) {
+          this.session.messages.push({ role: 'assistant', content })
+          const readResults: string[] = []
+          for (const fp of readRequests.slice(0, MAX_AGENTIC_READS - readsPerformed)) {
+            const fileContent = this.executeRead(fp)
+            readResults.push(`Contents of \`${fp}\`:\n\`\`\`\n${fileContent}\n\`\`\``)
+            readsPerformed++
+          }
+          this.session.messages.push({ role: 'user', content: readResults.join('\n\n') })
+          continue
+        }
+      }
+
       this.session.messages.push({ role: 'assistant', content })
       this.session.turns++
       this.session.updatedAt = new Date().toISOString()
@@ -188,16 +250,20 @@ export class Orchestrator {
     }
 
     const status = new ThinkingStatus()
-    if (needsCodeContext(input)) {
+    const useAgenticContext = needsCodeContext(input)
+    if (useAgenticContext) {
       status.start('Scanning project')
-      await this.buildContext(input, (stage) => status.update(stage))
+      await this.suggestContext(input, (stage) => status.update(stage))
     } else {
       this.promptBuilder.setFileContext('')
+      this.promptBuilder.clearSuggestions()
       const systemMsg = this.promptBuilder.buildSystem()
       this.contextEngine.setSystemMessage(systemMsg)
       status.start('Thinking')
     }
     this.session.messages.push(this.promptBuilder.buildUser(input))
+
+    let readsPerformed = 0
 
     for (let i = 0; i < this.maxIterations; i++) {
       const pruned = this.contextEngine.prune(this.session.messages)
@@ -234,6 +300,30 @@ export class Orchestrator {
       if (firstToken) status.stop()
 
       const content = trimRepeatedTail(accumulated)
+
+      // Agentic read loop: detect @read(path) patterns
+      if (useAgenticContext && readsPerformed < MAX_AGENTIC_READS) {
+        const readRequests = this.extractReads(content)
+        if (readRequests.length > 0) {
+          this.session.messages.push({ role: 'assistant', content })
+
+          const readResults: string[] = []
+          for (const fp of readRequests.slice(0, MAX_AGENTIC_READS - readsPerformed)) {
+            status.start('Reading file')
+            const fileContent = this.executeRead(fp)
+            readResults.push(`Contents of \`${fp}\`:\n\`\`\`\n${fileContent}\n\`\`\``)
+            readsPerformed++
+          }
+          status.stop()
+
+          // Inject file contents and continue the loop
+          const readMsg = readResults.join('\n\n')
+          this.session.messages.push({ role: 'user', content: readMsg })
+          onToken?.('\n')
+          continue
+        }
+      }
+
       this.session.messages.push({ role: 'assistant', content })
       this.session.turns++
       this.session.updatedAt = new Date().toISOString()

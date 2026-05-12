@@ -2,10 +2,22 @@ import type { Tool } from '../types.js'
 import { readFileSync, writeFileSync, mkdirSync, statSync, openSync, readSync, closeSync } from 'fs'
 import { resolve, dirname } from 'path'
 
-const MAX_READ_SIZE = 1_048_576
+const MAX_READ_SIZE = 200_000
 const MAX_OUTPUT_LINES = 200
 const DEFAULT_LIMIT = 200
 const BINARY_CHECK_BYTES = 4096
+
+function getProjectRoot(): string {
+  return process.cwd()
+}
+
+function assertSandbox(filePath: string): void {
+  const root = getProjectRoot()
+  const resolved = resolve(root, filePath)
+  if (!resolved.startsWith(root)) {
+    throw new Error('Access denied: path is outside project root')
+  }
+}
 
 function isBinary(filePath: string): boolean {
   try {
@@ -37,15 +49,21 @@ export const readTool: Tool = {
     },
   },
   handler: async (args) => {
-    const filePath = resolve(process.cwd(), args.file_path as string)
+    const rawPath = args.file_path as string
+    try {
+      assertSandbox(rawPath)
+    } catch {
+      return `Error: Access denied — path is outside project root`
+    }
+    const filePath = resolve(process.cwd(), rawPath)
 
     try {
       const stat = statSync(filePath)
-      if (!stat.isFile()) return `Error: '${args.file_path}' is not a file`
+      if (!stat.isFile()) return `Error: '${rawPath}' is not a file`
 
       if (stat.size > MAX_READ_SIZE) {
-        const mb = (stat.size / 1_048_576).toFixed(1)
-        return `Error: File too large (${mb} MB). Maximum read size is 1 MB. Use /grep to search for specific content or read a portion of the file.`
+        const kb = (stat.size / 1024).toFixed(0)
+        return `Error: File too large (${kb} KB). Maximum read size is 200 KB. Use offset/limit to read a portion.`
       }
 
       if (stat.size === 0) return '(empty file)'
@@ -93,13 +111,19 @@ export const writeTool: Tool = {
     },
   },
   handler: async (args) => {
-    const filePath = resolve(process.cwd(), args.file_path as string)
+    const rawPath = args.file_path as string
+    try {
+      assertSandbox(rawPath)
+    } catch {
+      return `Error: Access denied — path is outside project root`
+    }
+    const filePath = resolve(process.cwd(), rawPath)
     try {
       mkdirSync(dirname(filePath), { recursive: true })
       writeFileSync(filePath, args.content as string, 'utf-8')
       return `Wrote ${Buffer.byteLength(args.content as string, 'utf-8')} bytes to ${filePath}`
     } catch (err: any) {
-      if (err.code === 'EACCES') return `Error: Permission denied: '${args.file_path}'`
+      if (err.code === 'EACCES') return `Error: Permission denied: '${rawPath}'`
       return `Error: ${err.message}`
     }
   },

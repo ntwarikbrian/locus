@@ -124,6 +124,7 @@ export type ThinkingStage =
   | 'Building context'
   | 'Generating response'
   | 'Thinking'
+  | 'Reading file'
 
 export interface ThinkingProgressEvent {
   stage: ThinkingStage

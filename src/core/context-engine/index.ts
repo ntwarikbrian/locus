@@ -161,6 +161,52 @@ export class ContextEngine {
     return parts.join('\n').trim()
   }
 
+  async suggestContext(
+    query: string,
+    rootPath?: string,
+    onProgress?: (evt: ThinkingProgressEvent) => void,
+  ): Promise<{ suggestions: string; tree: string }> {
+    const dir = rootPath ?? process.cwd()
+    const started = Date.now()
+    const emit = (stage: ThinkingStage, detail?: string) => onProgress?.({ stage, elapsedMs: Date.now() - started, detail })
+
+    emit('Scanning project')
+    this.ensureScanned(dir)
+    const allFiles = buildFlatList(this.scanCache!.result)
+
+    emit('Loading index')
+    this.ensureIndex(dir, onProgress)
+    emit('Selecting symbols')
+    const chunks = this.indexer.search(query, ContextEngine.MAX_CONTEXT_FILES)
+    const fromIndex = chunks.length > 0
+
+    let suggestedFiles: string[]
+    if (fromIndex) {
+      suggestedFiles = [...new Set(chunks.map(c => c.chunk.filePath))]
+    } else {
+      const pathRelevant = this.selector.selectRelevant(query, allFiles, ContextEngine.MAX_CONTEXT_FILES)
+      suggestedFiles = pathRelevant.map(f => f.filePath)
+    }
+
+    if (suggestedFiles.length === 0) return { suggestions: '', tree: '' }
+
+    const relevantPaths = new Set(suggestedFiles)
+    const rootDir = this.scanCache!.rootPath
+    const tree = buildCompactTree(this.scanCache!.result.root, 3, rootDir.replace(/\\/g, '/'), relevantPaths)
+
+    const lines: string[] = []
+    for (const fp of suggestedFiles) {
+      const label = chunks.find(c => c.chunk.filePath === fp)?.chunk.label
+      if (label) {
+        lines.push(`- \`${fp}\` — contains ${label}`)
+      } else {
+        lines.push(`- \`${fp}\``)
+      }
+    }
+
+    return { suggestions: lines.join('\n'), tree: tree || '' }
+  }
+
   private hydrateChunk(chunk: import('../../repo/types.js').IndexChunk, rootPath: string): import('../../repo/types.js').IndexChunk {
     if (chunk.content && chunk.content.length > 0) return chunk
     const fullPath = join(rootPath, chunk.filePath)
