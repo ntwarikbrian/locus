@@ -88,6 +88,19 @@ export class Orchestrator {
     this.contextEngine.setSystemMessage(systemMsg)
   }
 
+  private async buildAgenticContext(input: string, onStage?: (stage: import('../repo/types.js').ThinkingStage) => void): Promise<void> {
+    // Auto-read top relevant files so model sees real code immediately
+    const ctx = await this.contextEngine.selectContext(input, undefined, (evt) => onStage?.(evt.stage))
+    this.promptBuilder.setFileContext(ctx)
+
+    // Also provide suggestions + agentic prompt so model can @read() more files
+    const { suggestions, tree } = await this.contextEngine.suggestContext(input)
+    this.promptBuilder.setFileSuggestions(suggestions, tree)
+
+    const systemMsg = this.promptBuilder.buildSystem()
+    this.contextEngine.setSystemMessage(systemMsg)
+  }
+
   private executeRead(filePath: string): string {
     const root = process.cwd()
     const resolved = resolve(root, filePath.trim())
@@ -171,7 +184,7 @@ export class Orchestrator {
 
     const useAgentic = needsCodeContext(input)
     if (useAgentic) {
-      await this.suggestContext(input)
+      await this.buildAgenticContext(input)
     } else {
       this.promptBuilder.setFileContext('')
       this.promptBuilder.clearSuggestions()
@@ -302,7 +315,7 @@ export class Orchestrator {
     const useAgenticContext = needsCodeContext(input)
     if (useAgenticContext) {
       status.start('Scanning project')
-      await this.suggestContext(input, (stage) => status.update(stage))
+      await this.buildAgenticContext(input, (stage) => status.update(stage))
     } else {
       this.promptBuilder.setFileContext('')
       this.promptBuilder.clearSuggestions()
@@ -503,10 +516,10 @@ export class Orchestrator {
 }
 
 const CODE_SIGNALS = [
-  /\b(file|function|class|module|import|export|variable|method|type|interface|error|bug|fix|refactor|test|lint|build|compile)\b/i,
-  /\b(src|lib|config|package|component|endpoint|route|api|database|schema|migration)\b/i,
-  /\b(where\s+is|show\s+me|find|locate|create|add|remove|update|change|rename|move|delete)\b/i,
-  /\b(how\s+to|implement|write|code|debug|deploy|install|setup|configure)\b/i,
+  /\b(files?|functions?|class(?:es)?|modules?|imports?|exports?|variables?|methods?|types?|interfaces?|errors?|bugs?|fix|refactor|tests?|lint|build|compile)\b/i,
+  /\b(src|lib|config|package|components?|endpoints?|routes?|api|database|schema|migration|codebase|project|architecture|source\s*code)\b/i,
+  /\b(where\s+is|show\s+me|find|locate|create|add|remove|update|change|rename|move|delete|trace|explain\s+how|which\s+files?|how\s+does)\b/i,
+  /\b(how\s+to|implement|write|code|debug|deploy|install|setup|configure|flow|handler|middleware|runtime|orchestrat)/i,
   /[./\\][\w-]+\.(ts|js|py|rs|go|java|json|yaml|md|css|html|tsx|jsx)\b/,
   /`[^`]+`/,
 ]
