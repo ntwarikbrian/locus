@@ -36,12 +36,12 @@ export const readTool: Tool = {
     type: 'function',
     function: {
       name: 'read',
-      description: 'Read a file and return its contents with line numbers. Max file size: 1 MB. Max output: 200 lines.',
+      description: 'Read a file and return its RAW contents. Use this AFTER using glob to discover files. Always glob first to find the correct paths, then read to inspect content. For large files, use offset and limit to read specific sections. Returns the actual file content without line number prefixes.',
       parameters: {
         type: 'object',
         properties: {
-          file_path: { type: 'string', description: 'Path to the file to read' },
-          offset: { type: 'number', description: 'Line number to start from (1-indexed)' },
+          file_path: { type: 'string', description: 'Path to the file to read (e.g. "src/auth/types.ts")' },
+          offset: { type: 'number', description: 'Line number to start from (1-indexed, for partial reads)' },
           limit: { type: 'number', description: 'Max number of lines to read (default 200, max 500)' },
         },
         required: ['file_path'],
@@ -80,11 +80,21 @@ export const readTool: Tool = {
 
       if (selected.length === 0) return '(empty)'
 
-      let result = selected.map((line, i) => `${offset + i}: ${line}`).join('\n')
+      let result: string
+      const isPartialRead = offset > 1 || args.limit !== undefined
+
+      if (isPartialRead) {
+        const header = `--- ${rawPath}: lines ${offset}-${offset + selected.length - 1} ---`
+        result = header + '\n' + selected.join('\n')
+      } else {
+        result = selected.join('\n')
+      }
+
       if (selected.length < lines.length - offset + 1) {
         const remaining = lines.length - offset + 1 - selected.length
-        result += `\n... (${remaining} more lines — use offset=${offset + limit} to continue)`
+        result += `\n--- (${remaining} more lines — use offset=${offset + limit} to continue) ---`
       }
+
       return result
     } catch (err: any) {
       if (err.code === 'ENOENT') return `Error: File not found: '${args.file_path}'`

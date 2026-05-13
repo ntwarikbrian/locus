@@ -17,6 +17,7 @@ import { getToolDefinitions, getTool } from '../tools/registry.js'
 
 const MAX_AGENTIC_READS = 8
 const MAX_TOOL_CALLS = 10
+const MAX_GREP_CALLS = 3
 const MAX_READ_SIZE = 200_000
 const READ_PATTERN = /@read\(([^)]+)\)/g
 
@@ -89,12 +90,8 @@ export class Orchestrator {
   }
 
   private async buildAgenticContext(input: string, onStage?: (stage: import('../repo/types.js').ThinkingStage) => void): Promise<void> {
-    // Auto-read top relevant files so model sees real code immediately
-    const ctx = await this.contextEngine.selectContext(input, undefined, (evt) => onStage?.(evt.stage))
-    this.promptBuilder.setFileContext(ctx)
-
-    // Also provide suggestions + agentic prompt so model can @read() more files
-    const { suggestions, tree } = await this.contextEngine.suggestContext(input)
+    const { suggestions, tree } = await this.contextEngine.suggestContext(input, undefined, (evt) => onStage?.(evt.stage))
+    this.promptBuilder.setFileContext('')
     this.promptBuilder.setFileSuggestions(suggestions, tree)
 
     const systemMsg = this.promptBuilder.buildSystem()
@@ -113,7 +110,16 @@ export class Orchestrator {
       const content = readFileSync(resolved, 'utf-8')
       const lines = content.split('\n')
       const limit = Math.min(lines.length, 200)
-      return lines.slice(0, limit).map((l, i) => `${i + 1}: ${l}`).join('\n')
+      const selected = lines.slice(0, limit)
+
+      let result = selected.join('\n')
+
+      if (selected.length < lines.length) {
+        const remaining = lines.length - selected.length
+        result += `\n--- (${remaining} more lines in file) ---`
+      }
+
+      return result
     } catch (err: any) {
       if (err.code === 'ENOENT') return `Error: File not found: '${filePath}'`
       return `Error: ${err.message}`
@@ -199,6 +205,7 @@ export class Orchestrator {
 
     let readsPerformed = 0
     let toolCallsUsed = 0
+    let grepCallsUsed = 0
     const readFilesSet = new Set<string>()
     for (let i = 0; i < this.maxIterations; i++) {
       const pruned = this.contextEngine.prune(this.session.messages)
@@ -208,10 +215,14 @@ export class Orchestrator {
 
       const content = response.content ?? ''
 
-      // Handle tool calls from function-calling protocol
       if (response.tool_calls && response.tool_calls.length > 0 && toolCallsUsed < MAX_TOOL_CALLS) {
         this.session.messages.push({ role: 'assistant', content: content || null, tool_calls: response.tool_calls })
         for (const tc of response.tool_calls) {
+          const isGrep = tc.function.name === 'grep'
+          if (isGrep && grepCallsUsed >= MAX_GREP_CALLS) {
+            this.session.messages.push({ role: 'tool', content: `Grep limit reached (${MAX_GREP_CALLS} calls). Use read to inspect specific files.`, tool_call_id: tc.id })
+            continue
+          }
           const tool = getTool(tc.function.name)
           if (tool) {
             try {
@@ -223,6 +234,7 @@ export class Orchestrator {
               this.session.messages.push({ role: 'tool', content: `Error: ${err.message}`, tool_call_id: tc.id })
             }
             toolCallsUsed++
+            if (isGrep) grepCallsUsed++
           }
         }
         continue
@@ -331,6 +343,7 @@ export class Orchestrator {
 
     let readsPerformed = 0
     let toolCallsUsed = 0
+    let grepCallsUsed = 0
     const readFilesSet = new Set<string>()
 
     for (let i = 0; i < this.maxIterations; i++) {
@@ -372,10 +385,14 @@ export class Orchestrator {
 
       const content = trimRepeatedTail(accumulated)
 
-      // Handle tool calls from function-calling protocol
       if (streamResult?.tool_calls && streamResult.tool_calls.length > 0 && toolCallsUsed < MAX_TOOL_CALLS) {
         this.session.messages.push({ role: 'assistant', content: content || null, tool_calls: streamResult.tool_calls })
         for (const tc of streamResult.tool_calls) {
+          const isGrep = tc.function.name === 'grep'
+          if (isGrep && grepCallsUsed >= MAX_GREP_CALLS) {
+            this.session.messages.push({ role: 'tool', content: `Grep limit reached (${MAX_GREP_CALLS} calls). Use read to inspect specific files.`, tool_call_id: tc.id })
+            continue
+          }
           const tool = getTool(tc.function.name)
           if (tool) {
             status.start('Running tool')
@@ -391,6 +408,7 @@ export class Orchestrator {
             }
             status.stop()
             toolCallsUsed++
+            if (isGrep) grepCallsUsed++
           }
         }
         continue
